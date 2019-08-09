@@ -1,4 +1,4 @@
-package facetracking
+package main
 
 import (
 	"fmt"
@@ -6,12 +6,9 @@ import (
 	"image/color"
 	"io"
 	"math"
-	"os"
 	"os/exec"
 	"strconv"
 	"time"
-
-	//"gobot.io/x/gobot/platforms/joystick"
 
 	"gobot.io/x/gobot"
 	"gobot.io/x/gobot/platforms/dji/tello"
@@ -19,34 +16,56 @@ import (
 	"gocv.io/x/gocv"
 )
 
-//const maxJoyVal = 32768
 const frameX = 800
 const frameY = 600
 const frameSize = frameX * frameY * 3
 
-var drone = tello.NewDriver("8890")
-var window = gocv.NewWindow("Tello")
+var green = color.RGBA{0, 255, 0, 0}
 
-var ffmpeg = exec.Command("ffmpeg", "-hwaccel", "auto", "-hwaccel_device", "opencl", "-i", "pipe:0",
-	"-pix_fmt", "bgr24", "-s", strconv.Itoa(frameX)+"x"+strconv.Itoa(frameY), "-f", "rawvideo", "pipe:1")
-var ffmpegIn, _ = ffmpeg.StdinPipe()
-var ffmpegOut, _ = ffmpeg.StdoutPipe()
-
-//var joyAdaptor = joystick.NewAdaptor()
-//var stick = joystick.NewDriver(joyAdaptor, "dualshock4")
 var flightData *tello.FlightData
 var tracking = false
 var detectSize = false
 var distTolerance = 0.05 * dist(0, 0, frameX, frameY)
 
-// KEYBOARD added
-var keys = keyboard.NewDriver()
 
-func init() {
-	//handleJoystick()
-	handleKeys()
 
-	go func() {
+func main() {
+	drone := tello.NewDriver("8890")
+	window := gocv.NewWindow("Tello")
+
+	ffmpeg := exec.Command("ffmpeg", "-hwaccel", "auto", "-hwaccel_device", "opencl", "-i", "pipe:0",
+		"-pix_fmt", "bgr24", "-s", strconv.Itoa(frameX)+"x"+strconv.Itoa(frameY), "-f", "rawvideo", "pipe:1")
+	ffmpegIn, _ := ffmpeg.StdinPipe()
+	ffmpegOut, _ := ffmpeg.StdoutPipe()
+
+	proto := "./facetracking/proto.txt"
+	model := "./facetracking/model"
+
+	net := gocv.ReadNetFromCaffe(proto, model)
+	if net.Empty() {
+		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
+		return
+	}
+	defer net.Close()
+
+	if net.Empty() {
+		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
+		return
+	}
+	defer net.Close()
+
+	// init values
+	refDistance := float64(0)
+	detected := false
+	left := float32(0)
+	top := float32(0)
+	right := float32(0)
+	bottom := float32(0)
+
+	keys := keyboard.NewDriver()
+	handleKeys(keys, drone)
+
+	work := func() {
 		if err := ffmpeg.Start(); err != nil {
 			fmt.Println(err)
 			return
@@ -72,50 +91,19 @@ func init() {
 				fmt.Println(err)
 			}
 		})
-
-		robot := gobot.NewRobot("tello",
-			[]gobot.Connection{},
-			//[]gobot.Connection{joyAdaptor},
-			//[]gobot.Device{stick},
-			[]gobot.Device{drone},
-			[]gobot.Device{keys},
-		)
-
-		robot.Start()
-	}()
-}
-
-func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("How to run:\ngo run facetracking.go [protofile] [modelfile]")
-		return
 	}
 
-	proto := os.Args[1]
-	model := os.Args[2]
+	robot := gobot.NewRobot("tello",
+		[]gobot.Connection{},
+		[]gobot.Device{drone},
+		[]gobot.Device{keys},
+		work,
+	)
 
-	net := gocv.ReadNetFromCaffe(proto, model)
-	if net.Empty() {
-		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
-		return
-	}
-	defer net.Close()
+	// calling Start(false) lets the Start routine return immediately without an additional blocking goroutine
+	robot.Start(false)
 
-	green := color.RGBA{0, 255, 0, 0}
-
-	if net.Empty() {
-		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
-		return
-	}
-	defer net.Close()
-
-	refDistance := float64(0)
-	detected := false
-	left := float32(0)
-	top := float32(0)
-	right := float32(0)
-	bottom := float32(0)
-
+	// now handle video frames from ffmpeg stream in main thread, to be macOS/Windows friendly
 	for {
 		buf := make([]byte, frameSize)
 		if _, err := io.ReadFull(ffmpegOut, buf); err != nil {
@@ -140,24 +128,27 @@ func main() {
 		defer detections.Close()
 
 		for r := 0; r < detections.Rows(); r++ {
-			confidence := detections.GetFloatAt(r, 2)
+			//confidence := detections.GetFloatAt(r, 2)
+			confidence := detections.GetDoubleAt(r, 2)
 			if confidence < 0.5 {
+				// let's ignore those with less than 50% of confidence
 				continue
 			}
-			fmt.Printf("Face detected [%v%%] \n", confidence)
+			fmt.Printf("Face detected [%v%%] \n", math.Round(confidence*100))
 
 			left = detections.GetFloatAt(r, 3) * W
 			top = detections.GetFloatAt(r, 4) * H
 			right = detections.GetFloatAt(r, 5) * W
 			bottom = detections.GetFloatAt(r, 6) * H
 
+			// scale to video size:
 			left = min(max(0, left), W-1)
 			right = min(max(0, right), W-1)
 			bottom = min(max(0, bottom), H-1)
 			top = min(max(0, top), H-1)
 
+			// draw a rectangle over the face recently detected
 			rect := image.Rect(int(left), int(top), int(right), int(bottom))
-			// draw a rectangle ove the face recently detected
 			gocv.Rectangle(&img, rect, green, 3)
 			detected = true
 		}
@@ -174,25 +165,25 @@ func main() {
 		if detectSize {
 			detectSize = false
 			// takes the initial rectangle diagonal size, as a reference to know later if
-			// the dorne is closer or farther.
+			// the drone is closer or farther.
 			refDistance = dist(left, top, right, bottom)
 		}
 
-		followFace(left, top, right, bottom, refDistance)
+		followFace(drone, left, top, right, bottom, refDistance)
 	}
 }
 
 /*
  It moves the drone in order to follow the face detected, if any parameter is out of the center
 */
-func followFace(left, top, right, bottom float32, refDistance float64) {
+func followFace(drone *tello.Driver, left, top, right, bottom float32, refDistance float64) {
 	// patch
 	W := float32(frameX)
 	H := float32(frameY)
 	// ---
 	actualDistance := dist(left, top, right, bottom)
 	// let's see where is the face rectangle to know if the drone meeds to move:
-	// firts the x axis:
+	// first the x axis:
 	if right < W/2 {
 		/*         W/2
 		+-----------+----------+
@@ -284,17 +275,20 @@ func max(a, b float32) float32 {
 }
 
 /*
-P : take off
-Q : land
-⬅: rotate left
-➨: rotate right
-⬇: go down
-⬆︎️: go up
-A : forward
-D : Backward
-T : Start / Stop face tracking
-*/
-func handleKeys() {
+ P : take off
+ Q : land
+ ⬅: rotate left
+ ➡: rotate right
+ ⬇: go down
+ ⬆︎️: go up
+ W : forward
+ S : Backward
+ A : Left
+ D : Right
+ T : Start / Stop face tracking
+ B : Battery indicator
+ */
+func handleKeys(keys *keyboard.Driver, drone *tello.Driver) {
 	keys.On(keyboard.Key, func(data interface{}) {
 		key := data.(keyboard.KeyEvent)
 		switch key.Key {
@@ -304,12 +298,18 @@ func handleKeys() {
 		case keyboard.ArrowRight:
 			fmt.Println(key.Char)
 			drone.Clockwise(25)
-		case keyboard.A:
+		case keyboard.W:
 			fmt.Println(key.Char)
 			drone.Forward(20)
-		case keyboard.D:
+		case keyboard.S:
 			fmt.Println(key.Char)
 			drone.Backward(20)
+		case keyboard.A:
+			fmt.Println(key.Char)
+			drone.Left(20)
+		case keyboard.D:
+			fmt.Println(key.Char)
+			drone.Right(20)
 		case keyboard.ArrowDown:
 			fmt.Println(key.Char)
 			drone.Down(20)
@@ -324,17 +324,19 @@ func handleKeys() {
 			drone.TakeOff()
 		case keyboard.T:
 			fmt.Println(key.Char)
-			faceTracking()
+			faceTracking(drone)
 		case keyboard.Escape:
-			resetDronePostion(drone)
+			resetDronePosition(drone)
+		case keyboard.B:
+			fmt.Printf("B == Battery: %v \n", flightData.BatteryPercentage)
 		}
 	})
 }
 
 /*
-	Starts / Stops the face tracking
+ Starts / Stops the face tracking
 */
-func faceTracking() {
+func faceTracking(drone *tello.Driver) {
 	drone.Forward(0)
 	drone.Up(0)
 	drone.Clockwise(0)
@@ -349,9 +351,9 @@ func faceTracking() {
 }
 
 /*
-	Stops the drone and just keep it where it is
+ Stops the drone and just keep it where it is
 */
-func resetDronePostion(drone *tello.Driver) {
+func resetDronePosition(drone *tello.Driver) {
 	drone.Forward(0)
 	drone.Backward(0)
 	drone.Up(0)
