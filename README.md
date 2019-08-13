@@ -27,7 +27,8 @@ It is also listening for any key pressed on the console to control the drone:
 
 | Key    |  Action   | 
 |--------|-----------|
-| P | take off | 
+| 1 | take off | 
+| 2 | take off by throwing it up | 
 | Q | land |
 | ⬅ | rotate left | 
 | ➡ | rotate right |
@@ -39,9 +40,15 @@ It is also listening for any key pressed on the console to control the drone:
 | D | Right |
 | **T** | **Start / Stop face tracking** |
 | B | Battery indicator| 
+| X | Stats (flight data) | 
 
-So, you need to run the program, then take off (`P`), put your face in front of the Tello camera (you should see a green rectangle in the video window) and then start tracking (`T`). Move yourself so the drone can follow you _(consider slow movements as this program is not optimized yet to support very fast movements)_
-Once you are done, then press `T` again to let the drone stop tracking
+So, you need to:
+- run the program
+- then take off (`1` or `2`)
+- put your face in front of the Tello camera (you should see a rectangle in the video window)
+- then start tracking (`T`)
+- Move yourself so the drone can follow you _(consider slow movements as this program is not optimized yet to support very fast movements)_
+- Once you are done, then press `T` again to let the drone stop tracking
 
 ### Credits
 Thanks to [@deadprogram](https://github.com/deadprogram) for the [examples provided](https://github.com/hybridgroup/gobot/tree/master/examples)

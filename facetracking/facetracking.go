@@ -5,7 +5,6 @@ import (
 	"image"
 	"image/color"
 	"io"
-	"math"
 	"os/exec"
 	"strconv"
 	"time"
@@ -14,25 +13,36 @@ import (
 	"gobot.io/x/gobot/platforms/dji/tello"
 	"gobot.io/x/gobot/platforms/keyboard"
 	"gocv.io/x/gocv"
+	"math"
 )
 
 const frameX = 800
 const frameY = 600
-const frameSize = frameX * frameY * 3
 
 var green = color.RGBA{0, 255, 0, 0}
 var red = color.RGBA{255, 0, 0, 0}
 var black = color.RGBA{0, 0, 0, 0}
 
+var drone = tello.NewDriver("8890")
+
 var flightData *tello.FlightData
+
+// flag to enable the tracking mode on the tello drone. If it's set to true then it follows the bigger face detected
 var tracking = false
-var detectSize = false
+
+// if more than one face is detected, just follow the more confident
+var rectToFollow image.Rectangle
+
+// after "start tracking" event happened, the first time a face is detected, it saves the rectangle size
+// (min to max points distance) to then know the the face detection rect is bigger or smaller (to move ff or bw)
+var detectedSize float64
+
+// there's certain margin of tolerance when the rectangle of the detected face change the size, to avoid moving
+// the drone unnecessarily
 var distTolerance = 0.05 * dist(0, 0, frameX, frameY)
 
-
-
 func main() {
-	drone := tello.NewDriver("8890")
+
 	window := gocv.NewWindow("Tello")
 
 	ffmpeg := exec.Command("ffmpeg", "-hwaccel", "auto", "-hwaccel_device", "opencl", "-i", "pipe:0",
@@ -57,8 +67,6 @@ func main() {
 	defer net.Close()
 
 	// init values
-	refDistance := float64(0)
-	detected := false
 	left := float32(0)
 	top := float32(0)
 	right := float32(0)
@@ -102,12 +110,20 @@ func main() {
 		work,
 	)
 
+	// there are too much processing here than FPS, so, let's send instruction to the drone every 200 ms,
+	// since the drone can't move so fast
+	gobot.Every(200*time.Millisecond, func() {
+		followFaceGlobal()
+	})
+
 	// calling Start(false) lets the Start routine return immediately without an additional blocking goroutine
 	robot.Start(false)
 
+	const frameSize = frameX * frameY * 3
+
 	// now handle video frames from ffmpeg stream in main thread, to be macOS/Windows friendly
 	for {
-		fmt.Println(time.Now().Format(time.StampMilli))
+		//fmt.Println(time.Now().Format(time.StampMilli))
 		buf := make([]byte, frameSize)
 		if _, err := io.ReadFull(ffmpegOut, buf); err != nil {
 			fmt.Println(err)
@@ -117,8 +133,13 @@ func main() {
 		if img.Empty() {
 			continue
 		}
+		// Draw middle axis to easy view if a rectangle (face detection) is centered or not
+		gocv.Line(&img, image.Pt(0, frameY/2), image.Pt(frameX, frameY/2), black, 2)
+		gocv.Line(&img, image.Pt(frameX/2, 0), image.Pt(frameX/2, frameY), black, 2)
+
 		W := float32(img.Cols())
 		H := float32(img.Rows())
+
 		blob := gocv.BlobFromImage(img, 1.0, image.Pt(128, 96), gocv.NewScalar(104.0, 177.0, 123.0, 0), false, false)
 		defer blob.Close()
 
@@ -130,8 +151,10 @@ func main() {
 		detections := gocv.GetBlobChannel(detBlob, 0, 0)
 		defer detections.Close()
 
-		var rectToFollow image.Rectangle // if more than one face is detected, just follow the more confident
 		var maxConfidence float32
+
+		detected := false
+		rectToFollow = image.ZR // empty rectangle
 
 		for r := 0; r < detections.Rows(); r++ {
 			confidence := detections.GetFloatAt(r, 2)
@@ -139,7 +162,7 @@ func main() {
 				// let's ignore those with less than 50% of confidence
 				continue
 			}
-			fmt.Printf("Face detected [%v%%] \n", confidence*100)
+			fmt.Printf("Face detected [%v%%] [tracking?%v]\n", int(confidence*100), tracking)
 
 			left = detections.GetFloatAt(r, 3) * W
 			top = detections.GetFloatAt(r, 4) * H
@@ -153,42 +176,43 @@ func main() {
 			top = min(max(0, top), H-1)
 
 			// draw a rectangle over the face recently detected
-			// green if the rec found is centered, red if it is not (drone must move)
+			// green if the rect found is centered, red if it is not
 			rect := image.Rect(int(left), int(top), int(right), int(bottom))
 			createRectWithProperColor(&img, rect)
 
 			detected = true
+			// select the more confident detection, drone can only follow one face at a time :)
 			if confidence > maxConfidence {
 				maxConfidence = confidence
 				rectToFollow = rect
 			}
 		}
 
-		// Draw middle axis to know where the rectangle is
-		gocv.Line(&img, image.Pt(0, frameY/2), image.Pt(frameX, frameY/2), black, 2)
-		gocv.Line(&img, image.Pt(frameX/2, 0), image.Pt(frameX/2, frameY), black, 2)
-
 		window.IMShow(img)
 		if window.WaitKey(10) >= 0 {
 			break
 		}
 
-		if !tracking || !detected {
+		if !tracking {
+			continue
+		}
+		if tracking && !detected {
+			fmt.Printf("[TRACKING] - %v - Tracking enabled but no face detected. The drone keeps hovering\n", time.Now().Format("15:04:05.000"))
+			drone.Hover()
 			continue
 		}
 
-		if detectSize {
-			detectSize = false
-			// takes the initial rectangle diagonal size, as a reference to know later if
-			// the drone is closer or farther.
-			refDistance = dist(left, top, right, bottom)
+		if detectedSize == 0 {
+			// takes the initial rectangle diagonal size, as a reference to know later if the drone is closer or farther
+			detectedSize = dist(left, top, right, bottom)
 		}
-
-		//followFace(drone, left, top, right, bottom, refDistance)
-		followFace(drone, rectToFollow, refDistance)
 	}
+
 }
 
+/*
+ Draws a RED rectangle if it is not centered, or a GREEN rectangle if it is centered
+*/
 func createRectWithProperColor(img *gocv.Mat, rect image.Rectangle) {
 	if isRectangleCentered(rect) {
 		gocv.Rectangle(img, rect, green, 3)
@@ -197,101 +221,135 @@ func createRectWithProperColor(img *gocv.Mat, rect image.Rectangle) {
 	}
 }
 
+/*
+ Checks if a rectangle is centered in the window
+    	+----------------------+
+    	|           |          |
+    	|           |          |
+    	|           |          |
+    	|        +----+        |
+    	|        |  | |        |
+    	+----------------------+
+    	|        |  | |        |
+    	|        +----+        |
+    	|           |          |
+    	|           |          |
+    	|           |          |
+    	+----------------------+
+
+*/
 func isRectangleCentered(rect image.Rectangle) bool {
 	return rect.Max.X > frameX/2 && rect.Max.Y > frameY/2 && rect.Min.X < frameX/2 && rect.Min.Y < frameY/2
 }
 
+func followFaceGlobal() {
+	if !rectToFollow.Empty() {
+		followFace(drone, rectToFollow, detectedSize)
+	}
+}
+
 /*
- It moves the drone in order to follow the face detected, if any parameter is out of the center
+ It moves the drone in order to follow the face detected, if any parameter
+ is out of the X, Y and Z axis center
 */
 func followFace(drone *tello.Driver, rect image.Rectangle, refDistance float64) {
-//func followFace(drone *tello.Driver, left, top, right, bottom float32, refDistance float64) {
-	if isRectangleCentered(rect) {
-		// no need to move the drone while the rect is green
-		// FIXME now it's ignoring the distance
-		fmt.Println("Face tracking: HOVER drone")
-		drone.Hover()
-		return
-	}
-	// patch
-	W := float32(frameX)
-	H := float32(frameY)
-	// ---
-	left := float32(rect.Min.X)
-	top := float32(rect.Min.Y)
+	fmt.Printf("[FOLLOWING FACE] - %v : \n", time.Now().Format("15:04:05.000"))
+	followFaceX(drone, rect)
+	followFaceY(drone, rect)
+	followFaceZ(drone, rect, refDistance)
+}
+
+/*
+ Evaluates if the face detected (rect) is out of X axis center.
+ If so, moves the drone clockwise or counterclockwise.
+ In the following examples, in 1) it need to rotate counterclockwise, in 2) clockwise and in 3) stop
+  Ex 1: rotate counterclockwise   Ex 2 rotate clockwise         Ex 3 stop, it's centered
+	+-----------+----------+       +-----------+----------+      +-----------+----------+
+	|     +--+  |          |       |           |          |      |           |          |
+	|     |  |  |          |       |           |          |      |           |          |
+	|     |  |  |          |       |           |          |      |           |          |
+	|     +--+  |          |       |           |  +-----+ |      |           |          |
+	|           |          |       |           |  |     | |      |           |          |
+	+----------------------+       +----------------------+      +----------------------+
+	|           |          |       |           |  |     | |      |         +----+       |
+	|           |          |       |           |  +-----+ |      |         | |  |       |
+	|           |          |       |           |          |      |         | |  |       |
+	|           |          |       |           |          |      |         | |  |       |
+	|           |          |       |           |          |      |         +----+       |
+	+-----------+----------+       +-----------+----------+      +----------------------+
+*/
+func followFaceX(drone *tello.Driver, rect image.Rectangle) {
 	right := float32(rect.Max.X)
-	bottom := float32(rect.Max.Y)
-	actualDistance := dist(left, top, right, bottom)
-	// let's see where is the face rectangle to know if the drone needs to move:
-	// first the x axis:
-	if right < W/2 {
-		/*         W/2
-		+-----------+----------+
-		|     +--+  |          |
-		|     |  |  |          |
-		|     |  |  |          |
-		|     +--+  |          |
-		|           |          |
-		+----------------------+
-		|           |          |
-		|           |          |
-		|           |          |
-		|           |          |
-		|           |          |
-		+-----------+----------+
-		*/
+	left := float32(rect.Min.X)
+	fmt.Print("  * X -> ")
+	if right < frameX/2 && right > 0 {
+		// Ex 1
+		fmt.Printf("moving CounterClockwise [right=%v]\n", right)
 		drone.CounterClockwise(50)
-	} else if left > W/2 {
-		/*         W/2
-		+-----------+----------+
-		|           |          |
-		|           |          |
-		|           |          |
-		|           | +-----+  |
-		|           | |     |  |
-		+----------------------+
-		|           | |     |  |
-		|           | +-----+  |
-		|           |          |
-		|           |          |
-		|           |          |
-		+-----------+----------+
-		*/
+	} else if left > frameX/2 && frameX < frameX {
+		// Ex 2
+		fmt.Printf("moving Clockwise [left=%v]\n", left)
 		drone.Clockwise(50)
 	} else {
-		/*         W/2
-		+-----------+----------+
-		|           |          |
-		|           |          |
-		|           |          |
-		|           |          |
-		|           |          |
-		+----------------------+
-		|        +-----+       |
-		|        |  |  |       |
-		|        |  |  |       |
-		|        |  |  |       |
-		|        +-----+       |
-		+----------------------+
-		*/
+		// Ex 3
+		fmt.Printf("STOP Clockwise - [left=%v, right=%v]\n", left, right)
 		drone.Clockwise(0)
 	}
-	// then, the y axis:
-	if top < H/10 {
-		drone.Up(25)
-	} else if bottom > H-H/10 {
-		drone.Down(25)
+}
+
+/*
+ Evaluates if the face detected (rect) is out of Y axis center.
+ If so, moves the drone up or down
+ 1) Up                          2) Down                        Ex 3 stop, it's centered
+	+-----------+----------+       +-----------+----------+      +-----------+----------+
+	|    +---+  |          |       |           |          |      |           |          |
+	|    |   |  |          |       |           |          |      |           |          |
+	|    |   |  |          |       |           |          |      |           |          |
+	|    +---+  |          |       |           |          |      |           |   +----+ |
+	|           |          |       |           |          |      |           |   |    | |
+	+----------------------+       +----------------------+      +----------------------+  frameY/2
+	|           |          |       |      +---+|          |      |           |   |    | |
+	|           |          |       |      |   ||          |      |           |   +----+ |
+	|           |          |       |      |   ||          |      |           |          |
+	|           |          |       |      +---+|          |      |           |          |
+	|           |          |       |           |          |      |           |          |
+	+-----------+----------+       +-----------+----------+      +-----------+----------+
+*/
+func followFaceY(drone *tello.Driver, rect image.Rectangle) {
+	bottom := float32(rect.Max.Y)
+	top := float32(rect.Min.Y)
+	fmt.Print("  * Y -> ")
+	if bottom > frameY/2 && bottom > 0 {
+		fmt.Printf("moving Up [bottom=%v]\n", bottom)
+		drone.Up(50)
+	} else if top > frameY/2 && top < frameY {
+		fmt.Printf("moving Down [top=%v]\n", top)
+		drone.Down(50)
 	} else {
+		fmt.Printf("Stop Up/Down [top=%v, bottom=%v]\n", top, bottom)
 		drone.Up(0) // implies Down = 0 as well
 	}
-	// and lastly, let's see if the rectangle is bigger than the reference when started face tracking
-	// if so, the move backward because it means the face is close to the drone
-	// if the rectangle is smaller, then the face is farther, so, move the drone forward to be closer to the face
+}
+
+/*
+ Check's if the rectangle is bigger than the reference when started face tracking
+ If so, moves the drone backward because it means the face is close to the drone
+ If the rectangle is smaller, then the face is farther, so, it moves the drone forward to be closer to the face
+*/
+func followFaceZ(drone *tello.Driver, rect image.Rectangle, refDistance float64) {
+	if refDistance == 0 {
+		return
+	}
+	actualDistance := dist(float32(rect.Min.X), float32(rect.Min.Y), float32(rect.Max.X), float32(rect.Max.Y))
+	fmt.Print("  * Z -> ")
 	if actualDistance < refDistance-distTolerance {
-		drone.Forward(20)
+		fmt.Printf("moving Forward (actual:%v - refDist:%v)\n", int(actualDistance), int(refDistance))
+		drone.Forward(50)
 	} else if actualDistance > refDistance+distTolerance {
-		drone.Backward(20)
+		fmt.Printf("moving backward (actual:%v - refDist:%v)\n", int(actualDistance), int(refDistance))
+		drone.Backward(50)
 	} else {
+		fmt.Printf("Stop FF/BW (actual:%v - refDist:%v)\n", int(actualDistance), int(refDistance))
 		drone.Forward(0) // implies backward = 0 as well
 	}
 }
@@ -330,7 +388,7 @@ func max(a, b float32) float32 {
  T : Start / Stop face tracking
  B : Battery indicator
  X : Stats (flightData)
- */
+*/
 func handleKeys(keys *keyboard.Driver, drone *tello.Driver) {
 	keys.On(keyboard.Key, func(data interface{}) {
 		key := data.(keyboard.KeyEvent)
@@ -388,16 +446,12 @@ func handleKeys(keys *keyboard.Driver, drone *tello.Driver) {
  Starts / Stops the face tracking
 */
 func faceTracking(drone *tello.Driver) {
-	//drone.Forward(0)
-	//drone.Up(0)
-	//drone.Clockwise(0)
 	drone.Hover()
 	tracking = !tracking
+	detectedSize = 0
 	if tracking {
-		detectSize = true
 		fmt.Println("START face tracking")
 	} else {
-		detectSize = false
 		fmt.Println("STOP face tracking")
 	}
 }
