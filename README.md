@@ -40,7 +40,9 @@ It is also listening for any key pressed on the console to control the drone:
 | D | Right |
 | **T** | **Start / Stop face tracking** |
 | B | Battery indicator| 
-| X | Stats (flight data) | 
+| X | Stats (flight data) |
+| Spacebar | Hover |
+| ESC | Quit Program | 
 
 So, you need to:
 - run the program

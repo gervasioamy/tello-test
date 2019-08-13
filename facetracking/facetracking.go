@@ -17,8 +17,16 @@ import (
 	"math"
 )
 
-const frameX = 800
-const frameY = 600
+const (
+	// Window size
+	frameX = 800
+	frameY = 600
+
+	// the speed to move the drone while following a face (1-100)
+	followSpeed = 30
+)
+
+var programRunning = true
 
 var green = color.RGBA{0, 255, 0, 0}
 var red = color.RGBA{255, 0, 0, 0}
@@ -28,9 +36,12 @@ var drone = tello.NewDriver("8890")
 
 var flightData *tello.FlightData
 
+var initialBattery int8
+
 // flag to enable the tracking mode on the tello drone. If it's set to true then it follows the bigger face detected
 var tracking = false
 
+// rectToFollow will save the current rectangle (face) the drone should follow (if tracking mode is enabled)
 // if more than one face is detected, just follow the more confident
 var rectToFollow image.Rectangle
 
@@ -44,7 +55,8 @@ var distTolerance = 0.05 * dist(0, 0, frameX, frameY)
 
 func main() {
 	setupLogger()
-	window := gocv.NewWindow("Tello")
+	defer calculateUsedBattery()
+
 	ffmpeg := exec.Command("ffmpeg", "-hwaccel", "auto", "-hwaccel_device", "opencl", "-i", "pipe:0",
 		"-pix_fmt", "bgr24", "-s", strconv.Itoa(frameX)+"x"+strconv.Itoa(frameY), "-f", "rawvideo", "pipe:1")
 	ffmpegIn, _ := ffmpeg.StdinPipe()
@@ -53,13 +65,13 @@ func main() {
 	proto := "./facetracking/proto.txt"
 	model := "./facetracking/model"
 
-	net := gocv.ReadNetFromCaffe(proto, model)
-	if net.Empty() {
-		log.Fatalf("Error reading network model from : %v %v\n", proto, model)
-		return
-	}
-	defer net.Close()
+	window := gocv.NewWindow("Tello")
+	defer window.Close()
 
+	img := gocv.NewMat()
+	defer img.Close()
+
+	net := gocv.ReadNetFromCaffe(proto, model)
 	if net.Empty() {
 		log.Fatalf("Error reading network model from : %v %v\n", proto, model)
 		return
@@ -77,12 +89,16 @@ func main() {
 
 	work := func() {
 		if err := ffmpeg.Start(); err != nil {
-			log.Fatal(err)
+			log.Fatal("Unexpected error at ffmpeg.Start() - ", err)
 			return
 		}
 
 		drone.On(tello.FlightDataEvent, func(data interface{}) {
 			flightData = data.(*tello.FlightData)
+			if initialBattery == 0 && flightData.BatteryPercentage > 0 {
+				initialBattery = flightData.BatteryPercentage
+				log.Infof("Initial battery = %v", initialBattery)
+			}
 		})
 
 		drone.On(tello.ConnectedEvent, func(data interface{}) {
@@ -110,8 +126,8 @@ func main() {
 		work,
 	)
 
-	// there are too much processing here than FPS, so, let's send instruction to the drone every 200 ms,
-	// since the drone can't move so fast
+	// there are too much processing here, in the infinite loop, than FPS, so,
+	// let's send instructions to the drone every 200 ms, since the drone can't move so fast
 	gobot.Every(200*time.Millisecond, func() {
 		followFaceGlobal()
 	})
@@ -119,36 +135,34 @@ func main() {
 	// calling Start(false) lets the Start routine return immediately without an additional blocking goroutine
 	robot.Start(false)
 
+	defer drone.Halt()
+
 	const frameSize = frameX * frameY * 3
 
 	// now handle video frames from ffmpeg stream in main thread, to be macOS/Windows friendly
-	for {
+	// until programRunning is set to false (see setupCloseHandler func)
+	for programRunning {
 		buf := make([]byte, frameSize)
 		if _, err := io.ReadFull(ffmpegOut, buf); err != nil {
 			log.Fatal("Error while reading from ffmpegOut", err)
 			continue
 		}
-		img, _ := gocv.NewMatFromBytes(frameY, frameX, gocv.MatTypeCV8UC3, buf)
+		img, _ = gocv.NewMatFromBytes(frameY, frameX, gocv.MatTypeCV8UC3, buf)
 		if img.Empty() {
 			continue
 		}
 		// Draw middle axis to easy view if a rectangle (face detection) is centered or not
 		gocv.Line(&img, image.Pt(0, frameY/2), image.Pt(frameX, frameY/2), black, 2)
 		gocv.Line(&img, image.Pt(frameX/2, 0), image.Pt(frameX/2, frameY), black, 2)
+		addTrackingText(&img)
 
 		W := float32(img.Cols())
 		H := float32(img.Rows())
 
 		blob := gocv.BlobFromImage(img, 1.0, image.Pt(128, 96), gocv.NewScalar(104.0, 177.0, 123.0, 0), false, false)
-		defer blob.Close()
-
 		net.SetInput(blob, "data")
-
 		detBlob := net.Forward("detection_out")
-		defer detBlob.Close()
-
 		detections := gocv.GetBlobChannel(detBlob, 0, 0)
-		defer detections.Close()
 
 		var maxConfidence float32
 
@@ -187,6 +201,10 @@ func main() {
 			}
 		}
 
+		blob.Close()
+		detBlob.Close()
+		detections.Close()
+
 		window.IMShow(img)
 		if window.WaitKey(10) >= 0 {
 			break
@@ -221,6 +239,15 @@ func createRectWithProperColor(img *gocv.Mat, rect image.Rectangle) {
 		gocv.Rectangle(img, rect, green, 3)
 	} else {
 		gocv.Rectangle(img, rect, red, 3)
+	}
+}
+
+/*
+ If tracking flag is enabled and current seconds are even, it adds a text "[TRACKING]" to the window
+*/
+func addTrackingText(img *gocv.Mat) {
+	if tracking && time.Now().Second()%2 == 0 {
+		gocv.PutText(img, "[TRACKING]", image.Pt(10, 20), gocv.FontHersheyPlain, 1.2, red, 2)
 	}
 }
 
@@ -293,12 +320,12 @@ func followFaceX(drone *tello.Driver, rect image.Rectangle) {
 	left := float32(rect.Min.X)
 	if right < frameX/2 && right > 0 {
 		// Ex 1
-		log.Debugf("[Following face] [X] Moving CounterClockwise (right=%v)", right)
-		drone.CounterClockwise(50)
-	} else if left > frameX/2 && frameX < frameX {
+		log.Infof("[Following face] [X] Moving CounterClockwise (right=%v)", right)
+		drone.CounterClockwise(followSpeed)
+	} else if left > frameX/2 && left < frameX {
 		// Ex 2
-		log.Debugf("[Following face] [X] Moving Clockwise (left=%v)", left)
-		drone.Clockwise(50)
+		log.Infof("[Following face] [X] Moving Clockwise (left=%v)", left)
+		drone.Clockwise(followSpeed)
 	} else {
 		// Ex 3
 		log.Debugf("[Following face] [X] Stop Clockwise - [left=%v, right=%v]", left, right)
@@ -328,11 +355,11 @@ func followFaceY(drone *tello.Driver, rect image.Rectangle) {
 	bottom := float32(rect.Max.Y)
 	top := float32(rect.Min.Y)
 	if bottom < frameY/2 && bottom > 0 {
-		log.Debugf("[Following face] [Y] Moving Up (bottom=%v)", bottom)
-		drone.Up(50)
+		log.Infof("[Following face] [Y] Moving Up (bottom=%v)", bottom)
+		drone.Up(followSpeed)
 	} else if top > frameY/2 && top < frameY {
-		log.Debugf("[Following face] [Y] Moving Down (top=%v)", top)
-		drone.Down(50)
+		log.Infof("[Following face] [Y] Moving Down (top=%v)", top)
+		drone.Down(followSpeed)
 	} else {
 		log.Debugf("[Following face] [Y] Stop Up/Down [top=%v, bottom=%v]\n", top, bottom)
 		drone.Up(0) // implies Down = 0 as well
@@ -350,11 +377,11 @@ func followFaceZ(drone *tello.Driver, rect image.Rectangle, refDistance float64)
 	}
 	actualDistance := dist(float32(rect.Min.X), float32(rect.Min.Y), float32(rect.Max.X), float32(rect.Max.Y))
 	if actualDistance < refDistance-distTolerance {
-		log.Debugf("[Following face] [Z] Moving Forward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
-		drone.Forward(50)
+		log.Infof("[Following face] [Z] Moving Forward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
+		drone.Forward(followSpeed)
 	} else if actualDistance > refDistance+distTolerance {
-		log.Debugf("[Following face] [Z] Moving Backward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
-		drone.Backward(50)
+		log.Infof("[Following face] [Z] Moving Backward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
+		drone.Backward(followSpeed)
 	} else {
 		log.Debugf("[Following face] [Z] Stop Forward/Backward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
 		drone.Forward(0) // implies backward = 0 as well
@@ -439,12 +466,20 @@ func handleKeys(keys *keyboard.Driver, drone *tello.Driver) {
 		case keyboard.T:
 			fmt.Println(key.Char)
 			faceTracking(drone)
-		case keyboard.Escape:
+		case keyboard.Spacebar:
 			drone.Hover()
 		case keyboard.B:
-			fmt.Printf("B == Battery: %v \n", flightData.BatteryPercentage)
+			log.WithFields(log.Fields{
+				"Battery":            flightData.BatteryPercentage,
+				"Battery Low":        flightData.BatteryLow,
+				"Battery State":      flightData.BatteryState,
+				"Drone Battery left": flightData.DroneBatteryLeft,
+			}).Info("Battery info")
 		case keyboard.X:
 			fmt.Printf("X == STATS:\n %+v\n", flightData)
+		case keyboard.Escape:
+			log.Warn("### QUIT ###")
+			programRunning = false
 		}
 	})
 }
@@ -461,4 +496,8 @@ func faceTracking(drone *tello.Driver) {
 	} else {
 		log.Info("STOP Face Tracking")
 	}
+}
+
+func calculateUsedBattery() {
+	log.Infof("== CONSUMED BATTERY = %v", initialBattery-flightData.BatteryPercentage)
 }
