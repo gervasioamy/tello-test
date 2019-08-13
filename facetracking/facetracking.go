@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"gobot.io/x/gobot"
 	"gobot.io/x/gobot/platforms/dji/tello"
 	"gobot.io/x/gobot/platforms/keyboard"
@@ -42,9 +43,8 @@ var detectedSize float64
 var distTolerance = 0.05 * dist(0, 0, frameX, frameY)
 
 func main() {
-
+	setupLogger()
 	window := gocv.NewWindow("Tello")
-
 	ffmpeg := exec.Command("ffmpeg", "-hwaccel", "auto", "-hwaccel_device", "opencl", "-i", "pipe:0",
 		"-pix_fmt", "bgr24", "-s", strconv.Itoa(frameX)+"x"+strconv.Itoa(frameY), "-f", "rawvideo", "pipe:1")
 	ffmpegIn, _ := ffmpeg.StdinPipe()
@@ -55,13 +55,13 @@ func main() {
 
 	net := gocv.ReadNetFromCaffe(proto, model)
 	if net.Empty() {
-		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
+		log.Fatalf("Error reading network model from : %v %v\n", proto, model)
 		return
 	}
 	defer net.Close()
 
 	if net.Empty() {
-		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
+		log.Fatalf("Error reading network model from : %v %v\n", proto, model)
 		return
 	}
 	defer net.Close()
@@ -77,7 +77,7 @@ func main() {
 
 	work := func() {
 		if err := ffmpeg.Start(); err != nil {
-			fmt.Println(err)
+			log.Fatal(err)
 			return
 		}
 
@@ -86,7 +86,7 @@ func main() {
 		})
 
 		drone.On(tello.ConnectedEvent, func(data interface{}) {
-			fmt.Println("Connected")
+			log.Info("Connected to Tello")
 			drone.StartVideo()
 			drone.SetVideoEncoderRate(tello.VideoBitRateAuto)
 			drone.SetExposure(0)
@@ -98,7 +98,7 @@ func main() {
 		drone.On(tello.VideoFrameEvent, func(data interface{}) {
 			pkt := data.([]byte)
 			if _, err := ffmpegIn.Write(pkt); err != nil {
-				fmt.Println(err)
+				log.Fatal(err)
 			}
 		})
 	}
@@ -123,10 +123,9 @@ func main() {
 
 	// now handle video frames from ffmpeg stream in main thread, to be macOS/Windows friendly
 	for {
-		//fmt.Println(time.Now().Format(time.StampMilli))
 		buf := make([]byte, frameSize)
 		if _, err := io.ReadFull(ffmpegOut, buf); err != nil {
-			fmt.Println(err)
+			log.Fatal("Error while reading from ffmpegOut", err)
 			continue
 		}
 		img, _ := gocv.NewMatFromBytes(frameY, frameX, gocv.MatTypeCV8UC3, buf)
@@ -153,7 +152,7 @@ func main() {
 
 		var maxConfidence float32
 
-		detected := false
+		//detected := false
 		rectToFollow = image.ZR // empty rectangle
 
 		for r := 0; r < detections.Rows(); r++ {
@@ -162,7 +161,7 @@ func main() {
 				// let's ignore those with less than 50% of confidence
 				continue
 			}
-			fmt.Printf("Face detected [%v%%] [tracking?%v]\n", int(confidence*100), tracking)
+			log.Tracef("Face detected [%v%%] [tracking = %v]\n", int(confidence*100), tracking)
 
 			left = detections.GetFloatAt(r, 3) * W
 			top = detections.GetFloatAt(r, 4) * H
@@ -180,7 +179,7 @@ func main() {
 			rect := image.Rect(int(left), int(top), int(right), int(bottom))
 			createRectWithProperColor(&img, rect)
 
-			detected = true
+			//detected = true
 			// select the more confident detection, drone can only follow one face at a time :)
 			if confidence > maxConfidence {
 				maxConfidence = confidence
@@ -196,11 +195,6 @@ func main() {
 		if !tracking {
 			continue
 		}
-		if tracking && !detected {
-			fmt.Printf("[TRACKING] - %v - Tracking enabled but no face detected. The drone keeps hovering\n", time.Now().Format("15:04:05.000"))
-			drone.Hover()
-			continue
-		}
 
 		if detectedSize == 0 {
 			// takes the initial rectangle diagonal size, as a reference to know later if the drone is closer or farther
@@ -208,6 +202,15 @@ func main() {
 		}
 	}
 
+}
+
+func setupLogger() {
+	log.SetFormatter(&log.TextFormatter{
+		DisableColors:   false,
+		FullTimestamp:   true,
+		TimestampFormat: "15:04:05.000",
+	})
+	log.SetLevel(log.DebugLevel)
 }
 
 /*
@@ -253,7 +256,14 @@ func followFaceGlobal() {
  is out of the X, Y and Z axis center
 */
 func followFace(drone *tello.Driver, rect image.Rectangle, refDistance float64) {
-	fmt.Printf("[FOLLOWING FACE] - %v : \n", time.Now().Format("15:04:05.000"))
+	if !tracking {
+		return
+	}
+	if rectToFollow.Empty() {
+		log.Debug("[TRACKING] - Tracking enabled but no face detected. The drone keeps hovering\n")
+		drone.Hover()
+		return
+	}
 	followFaceX(drone, rect)
 	followFaceY(drone, rect)
 	followFaceZ(drone, rect, refDistance)
@@ -281,18 +291,17 @@ func followFace(drone *tello.Driver, rect image.Rectangle, refDistance float64) 
 func followFaceX(drone *tello.Driver, rect image.Rectangle) {
 	right := float32(rect.Max.X)
 	left := float32(rect.Min.X)
-	fmt.Print("  * X -> ")
 	if right < frameX/2 && right > 0 {
 		// Ex 1
-		fmt.Printf("moving CounterClockwise [right=%v]\n", right)
+		log.Debugf("[Following face] [X] Moving CounterClockwise (right=%v)", right)
 		drone.CounterClockwise(50)
 	} else if left > frameX/2 && frameX < frameX {
 		// Ex 2
-		fmt.Printf("moving Clockwise [left=%v]\n", left)
+		log.Debugf("[Following face] [X] Moving Clockwise (left=%v)", left)
 		drone.Clockwise(50)
 	} else {
 		// Ex 3
-		fmt.Printf("STOP Clockwise - [left=%v, right=%v]\n", left, right)
+		log.Debugf("[Following face] [X] Stop Clockwise - [left=%v, right=%v]", left, right)
 		drone.Clockwise(0)
 	}
 }
@@ -318,15 +327,14 @@ func followFaceX(drone *tello.Driver, rect image.Rectangle) {
 func followFaceY(drone *tello.Driver, rect image.Rectangle) {
 	bottom := float32(rect.Max.Y)
 	top := float32(rect.Min.Y)
-	fmt.Print("  * Y -> ")
-	if bottom > frameY/2 && bottom > 0 {
-		fmt.Printf("moving Up [bottom=%v]\n", bottom)
+	if bottom < frameY/2 && bottom > 0 {
+		log.Debugf("[Following face] [Y] Moving Up (bottom=%v)", bottom)
 		drone.Up(50)
 	} else if top > frameY/2 && top < frameY {
-		fmt.Printf("moving Down [top=%v]\n", top)
+		log.Debugf("[Following face] [Y] Moving Down (top=%v)", top)
 		drone.Down(50)
 	} else {
-		fmt.Printf("Stop Up/Down [top=%v, bottom=%v]\n", top, bottom)
+		log.Debugf("[Following face] [Y] Stop Up/Down [top=%v, bottom=%v]\n", top, bottom)
 		drone.Up(0) // implies Down = 0 as well
 	}
 }
@@ -341,15 +349,14 @@ func followFaceZ(drone *tello.Driver, rect image.Rectangle, refDistance float64)
 		return
 	}
 	actualDistance := dist(float32(rect.Min.X), float32(rect.Min.Y), float32(rect.Max.X), float32(rect.Max.Y))
-	fmt.Print("  * Z -> ")
 	if actualDistance < refDistance-distTolerance {
-		fmt.Printf("moving Forward (actual:%v - refDist:%v)\n", int(actualDistance), int(refDistance))
+		log.Debugf("[Following face] [Z] Moving Forward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
 		drone.Forward(50)
 	} else if actualDistance > refDistance+distTolerance {
-		fmt.Printf("moving backward (actual:%v - refDist:%v)\n", int(actualDistance), int(refDistance))
+		log.Debugf("[Following face] [Z] Moving Backward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
 		drone.Backward(50)
 	} else {
-		fmt.Printf("Stop FF/BW (actual:%v - refDist:%v)\n", int(actualDistance), int(refDistance))
+		log.Debugf("[Following face] [Z] Stop Forward/Backward (actual:%v - refDist:%v)", int(actualDistance), int(refDistance))
 		drone.Forward(0) // implies backward = 0 as well
 	}
 }
@@ -450,8 +457,8 @@ func faceTracking(drone *tello.Driver) {
 	tracking = !tracking
 	detectedSize = 0
 	if tracking {
-		fmt.Println("START face tracking")
+		log.Info("START Face Tracking")
 	} else {
-		fmt.Println("STOP face tracking")
+		log.Info("STOP Face Tracking")
 	}
 }
