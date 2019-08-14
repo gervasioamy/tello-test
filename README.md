@@ -18,6 +18,8 @@ Before starting, you must have installed:
  - OpenCV: it can be installed by installing gocv [https://gocv.io/getting-started/](https://gocv.io/getting-started/)
 
 #### How to run it?
+First, connect to the drone's Wi-Fi network from your computer. It will be named something like "TELLO-XXXXXX".
+Then, run the program: 
 `go run ./facetracking/facetracking.go`
 
 #### How it works?
