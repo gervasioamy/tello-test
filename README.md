@@ -56,3 +56,4 @@ So, you need to:
 
 ### Credits
 Thanks to [@deadprogram](https://github.com/deadprogram) for the [examples provided](https://github.com/hybridgroup/gobot/tree/master/examples)
+Also this [blogpost](was helpful https://tellopilots.com/threads/face-tracking-with-tello-and-gocv.374/) was helpful
